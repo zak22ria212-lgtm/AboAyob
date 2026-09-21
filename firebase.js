@@ -120,10 +120,7 @@ try {
     lastRemoteJson = remoteJson;
     if (!applyingRemoteState && remoteJson !== localJson) {
       applyRemoteState(remoteState);
-      // تحديث واجهة التطبيق دون إعادة تحميل الصفحة أو إنشاء حلقة تحديث.
-      window.dispatchEvent(new CustomEvent("firebase-state-updated", {
-        detail: remoteState
-      }));
+      window.location.reload();
     }
   }, (error) => console.error("Firebase live sync failed:", error));
 } catch (error) {
