@@ -156,38 +156,30 @@ try {
 }
 
 
-// أضف هذه الدالة داخل ملف firebase_2.js وقم بتصديرها
-export async function addBookingDirectly(newBooking) {
-  try {
-    await runTransaction(db, async (tx) => {
-      const snap = await tx.get(stateRef);
-      const remote = normalize(snap.exists() ? snap.data() : {});
-      
-      // إضافة الحجز الجديد للقائمة
-      const updatedBookings = [...remote.bookings, newBooking];
-      
-      tx.set(stateRef, { 
-        ...remote, 
-        bookings: updatedBookings, 
-        updatedAt: serverTimestamp() 
-      }, { merge: true });
-    });
-    
-    console.log("تم الحفظ في Firebase بنجاح!");
-    return true;
-  } catch (error) {
-    console.error("فشل الحفظ في Firebase:", error);
-    return false;
-  }
-}// مثال على كود زر "حجز"
-async function handleBookingSubmit(bookingData) {
-  // 1. استدعاء دالة الحفظ المباشرة
+// 1. استيراد الدالة من ملف firebase_2.js في بداية الملف
+import { addBookingDirectly } from './firebase_2.js';
+
+// 2. ربط الدالة بزر الحجز أو نموذج الحجز (Form)
+const bookingForm = document.getElementById('bookingForm'); // استخدم id النموذج لديك
+
+bookingForm.addEventListener('submit', async function(event) {
+  event.preventDefault(); // منع إعادة تحميل الصفحة
+
+  // جمع بيانات الحجز من المدخلات
+  const bookingData = {
+    id: Date.now().toString(),
+    name: document.getElementById('nameInput').value,
+    date: document.getElementById('dateInput').value,
+    // ... باقي حقول الحجز الخاصة بك
+  };
+
+  // 3. استدعاء الكود الأخير هنا بدلاً من الاعتماد على localStorage
   const success = await addBookingDirectly(bookingData);
   
   if (success) {
-    // 2. إظهار رسالة النجاح فقط بعد التأكد من الحفظ في قاعدة البيانات
-    alert("تم الحجز بنجاح وإضافته للقائمة!");
+    alert("تم الحجز بنجاح!");
+    bookingForm.reset(); // إعادة ضبط النموذج
   } else {
     alert("حدث خطأ أثناء الحفظ، يرجى المحاولة مرة أخرى.");
   }
-}
+});
