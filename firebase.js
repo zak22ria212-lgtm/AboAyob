@@ -29,6 +29,7 @@ const managedKeys = new Set([
 ]);
 
 let applyingRemoteState = false;
+let firebaseInitialized = false;
 let writeTimer = null;
 let baselineState = null;
 
@@ -119,7 +120,7 @@ async function saveLocalChanges() {
   applyRemoteState(committed, true);
 }
 function scheduleSave() {
-  if (applyingRemoteState) return;
+  if (!firebaseInitialized || applyingRemoteState) return;
   clearTimeout(writeTimer);
   writeTimer = setTimeout(() => {
     saveLocalChanges().catch(error => console.error("Firebase save failed:", error));
@@ -147,6 +148,9 @@ try {
     baselineState = initial;
   }
 
+  firebaseInitialized = true;
+  window.dispatchEvent(new CustomEvent("firebase-state-updated", { detail: normalize(baselineState || readLocalState()) }));
+
   onSnapshot(stateRef, snapshot => {
     if (!snapshot.exists()) return;
     const remote = normalize(snapshot.data());
@@ -154,5 +158,6 @@ try {
     else baselineState = remote;
   }, error => console.error("Firebase live sync failed:", error));
 } catch (error) {
+  firebaseInitialized = true;
   console.error("Firebase initialization failed; local storage remains available:", error);
 }
