@@ -1,12 +1,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import {
-  getFirestore,
-  doc,
-  getDoc,
-  setDoc,
-  onSnapshot,
-  runTransaction,
-  serverTimestamp
+  getFirestore, doc, getDoc, setDoc, onSnapshot,
+  runTransaction, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -22,142 +17,140 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
 const stateRef = doc(db, "learning_resources_app", "main");
+const keys = new Set(["final_bookings_v5","final_subjects_v5","final_school_v5","final_owner_v5","final_notif_email","final_notif_phone"]);
 
-const managedKeys = new Set([
-  "final_bookings_v5", "final_subjects_v5", "final_school_v5",
-  "final_owner_v5", "final_notif_email", "final_notif_phone"
-]);
+let ready = false;
+let applyingRemote = false;
+let pendingLocal = false;
+let saving = false;
+let saveAgain = false;
+let settingsTimer = null;
+let baseline = null;
 
-let applyingRemoteState = false;
-let firebaseInitialized = false;
-let writeTimer = null;
-let baselineState = null;
+const parse = (v, fallback) => { try { return v ? JSON.parse(v) : fallback; } catch { return fallback; } };
+const normalize = (s = {}) => ({
+  bookings: Array.isArray(s.bookings) ? s.bookings : [],
+  subjects: Array.isArray(s.subjects) ? s.subjects : [],
+  schoolName: s.schoolName || "",
+  ownerEmail: s.ownerEmail || null,
+  notifEmail: s.notifEmail || "",
+  notifPhone: s.notifPhone || ""
+});
+const localState = () => normalize({
+  bookings: parse(localStorage.getItem("final_bookings_v5"), []),
+  subjects: parse(localStorage.getItem("final_subjects_v5"), []),
+  schoolName: localStorage.getItem("final_school_v5"),
+  ownerEmail: localStorage.getItem("final_owner_v5"),
+  notifEmail: localStorage.getItem("final_notif_email"),
+  notifPhone: localStorage.getItem("final_notif_phone")
+});
+const equal = (a,b) => JSON.stringify(a) === JSON.stringify(b);
+const mapBookings = list => new Map((list || []).filter(x => x && x.id).map(x => [String(x.id), x]));
 
-function parseJson(value, fallback) {
-  if (!value) return fallback;
-  try { return JSON.parse(value); } catch { return fallback; }
+function publish(state) {
+  window.dispatchEvent(new CustomEvent("firebase-state-updated", { detail: normalize(state) }));
 }
-function normalize(state = {}) {
-  return {
-    bookings: Array.isArray(state.bookings) ? state.bookings : [],
-    subjects: Array.isArray(state.subjects) ? state.subjects : [],
-    schoolName: state.schoolName || "",
-    ownerEmail: state.ownerEmail || null,
-    notifEmail: state.notifEmail || "",
-    notifPhone: state.notifPhone || ""
-  };
-}
-function readLocalState() {
-  return normalize({
-    bookings: parseJson(localStorage.getItem("final_bookings_v5"), []),
-    subjects: parseJson(localStorage.getItem("final_subjects_v5"), []),
-    schoolName: localStorage.getItem("final_school_v5") || "",
-    ownerEmail: localStorage.getItem("final_owner_v5") || null,
-    notifEmail: localStorage.getItem("final_notif_email") || "",
-    notifPhone: localStorage.getItem("final_notif_phone") || ""
-  });
-}
-function stateJson(state) { return JSON.stringify(normalize(state)); }
-function applyRemoteState(state, notify = true) {
-  const clean = normalize(state);
-  applyingRemoteState = true;
+function applyRemote(state, notify = true) {
+  const s = normalize(state);
+  applyingRemote = true;
   try {
-    localStorage.setItem("final_bookings_v5", JSON.stringify(clean.bookings));
-    localStorage.setItem("final_subjects_v5", JSON.stringify(clean.subjects));
-    localStorage.setItem("final_school_v5", clean.schoolName);
-    clean.ownerEmail ? localStorage.setItem("final_owner_v5", clean.ownerEmail) : localStorage.removeItem("final_owner_v5");
-    localStorage.setItem("final_notif_email", clean.notifEmail);
-    localStorage.setItem("final_notif_phone", clean.notifPhone);
-    baselineState = clean;
-  } finally {
-    applyingRemoteState = false;
-  }
-  if (notify) window.dispatchEvent(new CustomEvent("firebase-state-updated", { detail: clean }));
+    localStorage.setItem("final_bookings_v5", JSON.stringify(s.bookings));
+    localStorage.setItem("final_subjects_v5", JSON.stringify(s.subjects));
+    localStorage.setItem("final_school_v5", s.schoolName);
+    s.ownerEmail ? localStorage.setItem("final_owner_v5", s.ownerEmail) : localStorage.removeItem("final_owner_v5");
+    localStorage.setItem("final_notif_email", s.notifEmail);
+    localStorage.setItem("final_notif_phone", s.notifPhone);
+    baseline = s;
+  } finally { applyingRemote = false; }
+  if (notify) publish(s);
 }
-function bookingMap(items) {
-  return new Map((items || []).filter(x => x && x.id).map(x => [String(x.id), x]));
-}
-function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 
-async function saveLocalChanges() {
-  if (applyingRemoteState) return;
-  const local = readLocalState();
-  const base = normalize(baselineState || local);
-  const baseMap = bookingMap(base.bookings);
-  const localMap = bookingMap(local.bookings);
+async function saveChanges() {
+  if (!ready || applyingRemote) return;
+  if (saving) { saveAgain = true; return; }
+  saving = true;
+  pendingLocal = true;
+  const local = localState();
+  const base = normalize(baseline || local);
+  const baseMap = mapBookings(base.bookings);
+  const localMap = mapBookings(local.bookings);
+  const removed = [...baseMap.keys()].filter(id => !localMap.has(id));
+  const changed = [...localMap.entries()].filter(([id,item]) => !baseMap.has(id) || !equal(baseMap.get(id), item)).map(([,item]) => item);
 
-  const removedIds = [...baseMap.keys()].filter(id => !localMap.has(id));
-  const changedBookings = [...localMap.entries()]
-    .filter(([id, item]) => !baseMap.has(id) || !same(baseMap.get(id), item))
-    .map(([, item]) => item);
-
-  const committed = await runTransaction(db, async transaction => {
-    const snapshot = await transaction.get(stateRef);
-    const remote = normalize(snapshot.exists() ? snapshot.data() : {});
-    const mergedMap = bookingMap(remote.bookings);
-
-    removedIds.forEach(id => mergedMap.delete(id));
-    changedBookings.forEach(item => {
-      const occupied = [...mergedMap.values()].some(existing =>
-        String(existing.id) !== String(item.id) &&
-        existing.date === item.date && Number(existing.period) === Number(item.period)
-      );
-      if (!occupied) mergedMap.set(String(item.id), item);
+  try {
+    const merged = await runTransaction(db, async tx => {
+      const snap = await tx.get(stateRef);
+      const remote = normalize(snap.exists() ? snap.data() : {});
+      const remoteMap = mapBookings(remote.bookings);
+      removed.forEach(id => remoteMap.delete(id));
+      changed.forEach(item => {
+        const conflict = [...remoteMap.values()].some(x => String(x.id) !== String(item.id) && x.date === item.date && Number(x.period) === Number(item.period));
+        if (!conflict) remoteMap.set(String(item.id), item);
+      });
+      const result = {
+        bookings: [...remoteMap.values()],
+        subjects: equal(local.subjects, base.subjects) ? remote.subjects : local.subjects,
+        schoolName: local.schoolName === base.schoolName ? remote.schoolName : local.schoolName,
+        ownerEmail: local.ownerEmail === base.ownerEmail ? remote.ownerEmail : local.ownerEmail,
+        notifEmail: local.notifEmail === base.notifEmail ? remote.notifEmail : local.notifEmail,
+        notifPhone: local.notifPhone === base.notifPhone ? remote.notifPhone : local.notifPhone
+      };
+      tx.set(stateRef, { ...result, updatedAt: serverTimestamp() }, { merge: true });
+      return result;
     });
-
-    const merged = {
-      bookings: [...mergedMap.values()],
-      subjects: same(local.subjects, base.subjects) ? remote.subjects : local.subjects,
-      schoolName: local.schoolName === base.schoolName ? remote.schoolName : local.schoolName,
-      ownerEmail: local.ownerEmail === base.ownerEmail ? remote.ownerEmail : local.ownerEmail,
-      notifEmail: local.notifEmail === base.notifEmail ? remote.notifEmail : local.notifEmail,
-      notifPhone: local.notifPhone === base.notifPhone ? remote.notifPhone : local.notifPhone
-    };
-    transaction.set(stateRef, { ...merged, updatedAt: serverTimestamp() }, { merge: true });
-    return merged;
-  });
-
-  applyRemoteState(committed, true);
-}
-function scheduleSave() {
-  if (!firebaseInitialized || applyingRemoteState) return;
-  clearTimeout(writeTimer);
-  writeTimer = setTimeout(() => {
-    saveLocalChanges().catch(error => console.error("Firebase save failed:", error));
-  }, 400);
+    applyRemote(merged, true);
+  } catch (error) {
+    console.error("Firebase save failed:", error);
+    publish(localState());
+  } finally {
+    saving = false;
+    pendingLocal = false;
+    if (saveAgain) { saveAgain = false; queueMicrotask(saveChanges); }
+  }
 }
 
-const nativeSetItem = Storage.prototype.setItem;
-const nativeRemoveItem = Storage.prototype.removeItem;
+function requestSave(key) {
+  if (!ready || applyingRemote) return;
+  pendingLocal = true;
+  if (key === "final_bookings_v5") {
+    clearTimeout(settingsTimer);
+    queueMicrotask(saveChanges);
+  } else {
+    clearTimeout(settingsTimer);
+    settingsTimer = setTimeout(saveChanges, 300);
+  }
+}
+
+const nativeSet = Storage.prototype.setItem;
+const nativeRemove = Storage.prototype.removeItem;
 Storage.prototype.setItem = function(key, value) {
-  nativeSetItem.call(this, key, value);
-  if (this === localStorage && managedKeys.has(String(key))) scheduleSave();
+  nativeSet.call(this, key, value);
+  if (this === localStorage && keys.has(String(key))) requestSave(String(key));
 };
 Storage.prototype.removeItem = function(key) {
-  nativeRemoveItem.call(this, key);
-  if (this === localStorage && managedKeys.has(String(key))) scheduleSave();
+  nativeRemove.call(this, key);
+  if (this === localStorage && keys.has(String(key))) requestSave(String(key));
 };
 
 try {
-  const initialSnapshot = await getDoc(stateRef);
-  if (initialSnapshot.exists()) {
-    applyRemoteState(initialSnapshot.data(), false);
-  } else {
-    const initial = readLocalState();
+  const first = await getDoc(stateRef);
+  if (first.exists()) applyRemote(first.data(), true);
+  else {
+    const initial = localState();
     await setDoc(stateRef, { ...initial, updatedAt: serverTimestamp() }, { merge: true });
-    baselineState = initial;
+    baseline = initial;
+    publish(initial);
   }
+  ready = true;
 
-  firebaseInitialized = true;
-  window.dispatchEvent(new CustomEvent("firebase-state-updated", { detail: normalize(baselineState || readLocalState()) }));
-
-  onSnapshot(stateRef, snapshot => {
-    if (!snapshot.exists()) return;
-    const remote = normalize(snapshot.data());
-    if (stateJson(remote) !== stateJson(readLocalState())) applyRemoteState(remote, true);
-    else baselineState = remote;
+  onSnapshot(stateRef, snap => {
+    if (!snap.exists()) return;
+    const remote = normalize(snap.data());
+    if (pendingLocal || saving) return;
+    if (!equal(remote, localState())) applyRemote(remote, true);
+    else baseline = remote;
   }, error => console.error("Firebase live sync failed:", error));
 } catch (error) {
-  firebaseInitialized = true;
-  console.error("Firebase initialization failed; local storage remains available:", error);
+  ready = true;
+  console.error("Firebase initialization failed:", error);
 }
