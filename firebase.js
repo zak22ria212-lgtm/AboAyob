@@ -1,11 +1,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import {
-  getFirestore,
-  doc,
-  getDoc,
-  setDoc,
-  onSnapshot,
-  serverTimestamp
+  getFirestore, doc, getDoc, setDoc, onSnapshot,
+  runTransaction, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -20,112 +16,226 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
-
 const stateRef = doc(db, "learning_resources_app", "main");
-const managedKeys = new Set([
-  "final_bookings_v5",
-  "final_subjects_v5",
-  "final_school_v5",
-  "final_owner_v5",
-  "final_notif_email",
-  "final_notif_phone"
+
+const KEYS = new Set([
+  "final_bookings_v5", "final_subjects_v5", "final_school_v5",
+  "final_owner_v5", "final_notif_email", "final_notif_phone"
 ]);
+const BOOKING_KEY = "final_bookings_v5";
 
-let applyingRemoteState = false;
-let writeTimer = null;
-let lastRemoteJson = "";
+let ready = false;
+let applyingRemote = false;
+let saving = false;
+let saveAgain = false;
+let settingsTimer = null;
+let baseline = null;
+let lastPublished = "";
 
-function parseJson(value, fallback) {
-  if (!value) return fallback;
-  try { return JSON.parse(value); } catch { return fallback; }
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const parse = (value, fallback) => {
+  try { return value ? JSON.parse(value) : fallback; }
+  catch { return fallback; }
+};
+const normalize = (state = {}) => ({
+  bookings: Array.isArray(state.bookings) ? state.bookings : [],
+  subjects: Array.isArray(state.subjects) ? state.subjects : [],
+  schoolName: state.schoolName || "",
+  ownerEmail: state.ownerEmail || null,
+  notifEmail: state.notifEmail || "",
+  notifPhone: state.notifPhone || ""
+});
+const localState = () => normalize({
+  bookings: parse(localStorage.getItem(BOOKING_KEY), []),
+  subjects: parse(localStorage.getItem("final_subjects_v5"), []),
+  schoolName: localStorage.getItem("final_school_v5"),
+  ownerEmail: localStorage.getItem("final_owner_v5"),
+  notifEmail: localStorage.getItem("final_notif_email"),
+  notifPhone: localStorage.getItem("final_notif_phone")
+});
+const json = value => JSON.stringify(normalize(value));
+const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const bookingMap = list => new Map(
+  (Array.isArray(list) ? list : [])
+    .filter(item => item && item.id != null)
+    .map(item => [String(item.id), item])
+);
+const sameSlot = (a, b) =>
+  String(a?.date || "") === String(b?.date || "") &&
+  Number(a?.period) === Number(b?.period);
+
+function publish(state, extra = {}) {
+  const clean = normalize(state);
+  const signature = json(clean);
+  if (signature === lastPublished && !extra.force) return;
+  lastPublished = signature;
+  window.dispatchEvent(new CustomEvent("firebase-state-updated", {
+    detail: { ...clean, ...extra }
+  }));
 }
 
-function readLocalState() {
-  return {
-    bookings: parseJson(localStorage.getItem("final_bookings_v5"), []),
-    subjects: parseJson(localStorage.getItem("final_subjects_v5"), []),
-    schoolName: localStorage.getItem("final_school_v5") || "",
-    ownerEmail: localStorage.getItem("final_owner_v5") || null,
-    notifEmail: localStorage.getItem("final_notif_email") || "",
-    notifPhone: localStorage.getItem("final_notif_phone") || ""
-  };
-}
-
-function normalizedJson(state) {
-  return JSON.stringify({
-    bookings: Array.isArray(state.bookings) ? state.bookings : [],
-    subjects: Array.isArray(state.subjects) ? state.subjects : [],
-    schoolName: state.schoolName || "",
-    ownerEmail: state.ownerEmail || null,
-    notifEmail: state.notifEmail || "",
-    notifPhone: state.notifPhone || ""
-  });
-}
-
-function applyRemoteState(state) {
-  applyingRemoteState = true;
+function applyRemote(state, notify = true) {
+  const clean = normalize(state);
+  applyingRemote = true;
   try {
-    localStorage.setItem("final_bookings_v5", JSON.stringify(state.bookings || []));
-    localStorage.setItem("final_subjects_v5", JSON.stringify(state.subjects || []));
-    localStorage.setItem("final_school_v5", state.schoolName || "");
-    if (state.ownerEmail) localStorage.setItem("final_owner_v5", state.ownerEmail);
-    else localStorage.removeItem("final_owner_v5");
-    localStorage.setItem("final_notif_email", state.notifEmail || "");
-    localStorage.setItem("final_notif_phone", state.notifPhone || "");
+    localStorage.setItem(BOOKING_KEY, JSON.stringify(clean.bookings));
+    localStorage.setItem("final_subjects_v5", JSON.stringify(clean.subjects));
+    localStorage.setItem("final_school_v5", clean.schoolName);
+    clean.ownerEmail
+      ? localStorage.setItem("final_owner_v5", clean.ownerEmail)
+      : localStorage.removeItem("final_owner_v5");
+    localStorage.setItem("final_notif_email", clean.notifEmail);
+    localStorage.setItem("final_notif_phone", clean.notifPhone);
+    baseline = clean;
   } finally {
-    applyingRemoteState = false;
+    applyingRemote = false;
+  }
+  if (notify) publish(clean);
+}
+
+async function withRetry(action, attempts = 3) {
+  let lastError;
+  for (let i = 0; i < attempts; i++) {
+    try { return await action(); }
+    catch (error) {
+      lastError = error;
+      if (i < attempts - 1) await sleep(250 * (i + 1));
+    }
+  }
+  throw lastError;
+}
+
+async function saveChanges() {
+  if (!ready || applyingRemote) return;
+  if (saving) { saveAgain = true; return; }
+
+  saving = true;
+  const local = localState();
+  const base = normalize(baseline || local);
+  const baseMap = bookingMap(base.bookings);
+  const localMap = bookingMap(local.bookings);
+
+  const removedIds = [...baseMap.keys()].filter(id => !localMap.has(id));
+  const changedBookings = [...localMap.entries()]
+    .filter(([id, item]) => !baseMap.has(id) || !equal(baseMap.get(id), item))
+    .map(([, item]) => item);
+
+  try {
+    const result = await withRetry(() => runTransaction(db, async transaction => {
+      const snap = await transaction.get(stateRef);
+      const remote = normalize(snap.exists() ? snap.data() : {});
+      const remoteMap = bookingMap(remote.bookings);
+      const rejectedIds = [];
+
+      removedIds.forEach(id => remoteMap.delete(id));
+
+      for (const item of changedBookings) {
+        const conflict = [...remoteMap.values()].some(existing =>
+          String(existing.id) !== String(item.id) && sameSlot(existing, item)
+        );
+        if (conflict) rejectedIds.push(String(item.id));
+        else remoteMap.set(String(item.id), item);
+      }
+
+      const merged = {
+        bookings: [...remoteMap.values()],
+        subjects: equal(local.subjects, base.subjects) ? remote.subjects : local.subjects,
+        schoolName: local.schoolName === base.schoolName ? remote.schoolName : local.schoolName,
+        ownerEmail: local.ownerEmail === base.ownerEmail ? remote.ownerEmail : local.ownerEmail,
+        notifEmail: local.notifEmail === base.notifEmail ? remote.notifEmail : local.notifEmail,
+        notifPhone: local.notifPhone === base.notifPhone ? remote.notifPhone : local.notifPhone
+      };
+
+      transaction.set(stateRef, {
+        ...merged,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+
+      return { merged, rejectedIds };
+    }));
+
+    applyRemote(result.merged, false);
+    publish(result.merged, {
+      force: true,
+      rejectedBookingIds: result.rejectedIds,
+      syncStatus: result.rejectedIds.length ? "conflict" : "saved"
+    });
+  } catch (error) {
+    console.error("Firebase save failed:", error);
+    try {
+      const latest = await getDoc(stateRef);
+      if (latest.exists()) applyRemote(latest.data(), true);
+    } catch (refreshError) {
+      console.error("Firebase refresh failed:", refreshError);
+    }
+    publish(localState(), { force: true, syncStatus: "error" });
+  } finally {
+    saving = false;
+    if (saveAgain) {
+      saveAgain = false;
+      queueMicrotask(saveChanges);
+    }
   }
 }
 
-async function saveLocalState() {
-  const state = readLocalState();
-  lastRemoteJson = normalizedJson(state);
-  await setDoc(stateRef, { ...state, updatedAt: serverTimestamp() }, { merge: true });
-}
-
-function scheduleSave() {
-  if (applyingRemoteState) return;
-  clearTimeout(writeTimer);
-  writeTimer = setTimeout(() => {
-    saveLocalState().catch((error) => console.error("Firebase save failed:", error));
-  }, 350);
+function requestSave(key) {
+  if (!ready || applyingRemote) return;
+  if (key === BOOKING_KEY) {
+    clearTimeout(settingsTimer);
+    queueMicrotask(saveChanges);
+  } else {
+    clearTimeout(settingsTimer);
+    settingsTimer = setTimeout(saveChanges, 250);
+  }
 }
 
 const nativeSetItem = Storage.prototype.setItem;
 const nativeRemoveItem = Storage.prototype.removeItem;
 Storage.prototype.setItem = function(key, value) {
   nativeSetItem.call(this, key, value);
-  if (this === localStorage && managedKeys.has(String(key))) scheduleSave();
+  if (this === localStorage && KEYS.has(String(key))) requestSave(String(key));
 };
 Storage.prototype.removeItem = function(key) {
   nativeRemoveItem.call(this, key);
-  if (this === localStorage && managedKeys.has(String(key))) scheduleSave();
+  if (this === localStorage && KEYS.has(String(key))) requestSave(String(key));
 };
 
-try {
-  const initialSnapshot = await getDoc(stateRef);
-  if (initialSnapshot.exists()) {
-    const remoteState = initialSnapshot.data();
-    lastRemoteJson = normalizedJson(remoteState);
-    applyRemoteState(remoteState);
-  } else {
-    await saveLocalState();
-  }
-
-  onSnapshot(stateRef, (snapshot) => {
-    if (!snapshot.exists()) return;
-    const remoteState = snapshot.data();
-    const remoteJson = normalizedJson(remoteState);
-    const localJson = normalizedJson(readLocalState());
-    lastRemoteJson = remoteJson;
-    if (!applyingRemoteState && remoteJson !== localJson) {
-      applyRemoteState(remoteState);
-      // تحديث واجهة التطبيق دون إعادة تحميل الصفحة أو إنشاء حلقة تحديث.
-      window.dispatchEvent(new CustomEvent("firebase-state-updated", {
-        detail: remoteState
-      }));
+async function initializeSync() {
+  try {
+    const first = await getDoc(stateRef);
+    if (first.exists()) {
+      applyRemote(first.data(), true);
+    } else {
+      const initial = localState();
+      await setDoc(stateRef, { ...initial, updatedAt: serverTimestamp() }, { merge: true });
+      baseline = initial;
+      publish(initial);
     }
-  }, (error) => console.error("Firebase live sync failed:", error));
-} catch (error) {
-  console.error("Firebase initialization failed; the site will continue with local storage:", error);
+
+    ready = true;
+
+    onSnapshot(stateRef, snapshot => {
+      if (!snapshot.exists()) return;
+      const remote = normalize(snapshot.data());
+      if (saving) return;
+      if (!equal(remote, localState())) applyRemote(remote, true);
+      else baseline = remote;
+    }, error => console.error("Firebase live sync failed:", error));
+
+    window.addEventListener("online", async () => {
+      try {
+        const latest = await getDoc(stateRef);
+        if (latest.exists() && !saving) applyRemote(latest.data(), true);
+        await saveChanges();
+      } catch (error) {
+        console.error("Firebase reconnect failed:", error);
+      }
+    });
+  } catch (error) {
+    ready = true;
+    console.error("Firebase initialization failed:", error);
+    publish(localState(), { force: true, syncStatus: "offline" });
+  }
 }
+
+await initializeSync();
