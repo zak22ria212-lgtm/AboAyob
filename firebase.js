@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import {
-  getFirestore, doc, getDoc, setDoc, onSnapshot,
+  initializeFirestore, doc, getDoc, setDoc, onSnapshot,
   runTransaction, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
@@ -15,7 +15,7 @@ const firebaseConfig = {
 };
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app);
+export const db = initializeFirestore(app, { ignoreUndefinedProperties: true });
 const stateRef = doc(db, "learning_resources_app", "main");
 
 const KEYS = new Set([
@@ -53,6 +53,7 @@ const localState = () => normalize({
   notifEmail: localStorage.getItem("final_notif_email"),
   notifPhone: localStorage.getItem("final_notif_phone")
 });
+const sanitize = value => JSON.parse(JSON.stringify(value));
 const json = value => JSON.stringify(normalize(value));
 const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const bookingMap = list => new Map(
@@ -243,11 +244,13 @@ const syncReady = initializeSync();
 async function createBooking(booking) {
   await syncReady;
   if (!booking || booking.id == null) throw new Error("بيانات الحجز غير مكتملة");
+  booking = sanitize(booking);
 
   const result = await withRetry(() => runTransaction(db, async transaction => {
     const snap = await transaction.get(stateRef);
     const remote = normalize(snap.exists() ? snap.data() : {});
     const remoteMap = bookingMap(remote.bookings);
+    booking = sanitize(booking);
     const conflict = [...remoteMap.values()].some(existing =>
       String(existing.id) !== String(booking.id) && sameSlot(existing, booking)
     );
@@ -258,7 +261,8 @@ async function createBooking(booking) {
     }
     remoteMap.set(String(booking.id), booking);
     const merged = { ...remote, bookings: [...remoteMap.values()] };
-    transaction.set(stateRef, { ...merged, updatedAt: serverTimestamp() }, { merge: true });
+    transaction.set(stateRef, sanitize(merged), { merge: true });
+    transaction.set(stateRef, { updatedAt: serverTimestamp() }, { merge: true });
     return merged;
   }));
 
