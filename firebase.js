@@ -238,4 +238,34 @@ async function initializeSync() {
   }
 }
 
-await initializeSync();
+const syncReady = initializeSync();
+
+async function createBooking(booking) {
+  await syncReady;
+  if (!booking || booking.id == null) throw new Error("بيانات الحجز غير مكتملة");
+
+  const result = await withRetry(() => runTransaction(db, async transaction => {
+    const snap = await transaction.get(stateRef);
+    const remote = normalize(snap.exists() ? snap.data() : {});
+    const remoteMap = bookingMap(remote.bookings);
+    const conflict = [...remoteMap.values()].some(existing =>
+      String(existing.id) !== String(booking.id) && sameSlot(existing, booking)
+    );
+    if (conflict) {
+      const error = new Error("الفترة المحددة محجوزة مسبقاً");
+      error.code = "booking-conflict";
+      throw error;
+    }
+    remoteMap.set(String(booking.id), booking);
+    const merged = { ...remote, bookings: [...remoteMap.values()] };
+    transaction.set(stateRef, { ...merged, updatedAt: serverTimestamp() }, { merge: true });
+    return merged;
+  }));
+
+  applyRemote(result, false);
+  publish(result, { force: true, syncStatus: "saved", savedBookingId: String(booking.id) });
+  return result;
+}
+
+window.firebaseBookingAPI = Object.freeze({ createBooking });
+await syncReady;
